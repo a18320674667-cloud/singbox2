@@ -5,13 +5,12 @@
 # ==========================================================
 mkdir -p /etc/sing-box
 
-# 若当前不是从 /etc/sing-box/sb.sh 启动，则自动将完整脚本写入磁盘并绑定 sb
 if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "/bin/sb" ]; then
     cat > /etc/sing-box/sb.sh << '===SB_MAIN_SCRIPT_EOF==='
 #!/usr/bin/env bash
 
 # =========================
-# sing-box 64M极简低内存多协议脚本 (纯Base64输出版)
+# sing-box 64M极简低内存多协议脚本 (纯Base64输出 + 自动BBR版)
 # 支持协议: vless-reality | vmess-ws(argo) | hysteria2 | tuic5 | anytls | socks5 | ss2022
 # =========================
 
@@ -40,6 +39,7 @@ sub_file="${work_dir}/sub.txt"
 meta_file="${work_dir}/meta.conf"
 ports_file="${work_dir}/ports.list"
 swap_file="/swapfile_sb"
+bbr_conf="/etc/sysctl.d/99-sb-bbr.conf"
 
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
@@ -68,6 +68,91 @@ ensure_sb_links() {
     ln -sf "${work_dir}/sb.sh" /bin/sb 2>/dev/null || true
 }
 ensure_sb_links
+
+# =========================
+# BBR 加速管理模块 (自动开启 / 参数关闭 / 状态检测)
+# =========================
+check_bbr_status() {
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "unknown")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo "unknown")
+    if [ "$cc" = "bbr" ]; then
+        green "已开启 (${cc}+${qdisc})"
+    else
+        yellow "未开启 (当前: ${cc})"
+    fi
+}
+
+enable_bbr() {
+    yellow "正在开启 BBR 加速通道..."
+    # 尝试加载内核模块 (针对独立内核 KVM/Xen 小鸡)
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    modprobe sch_fq >/dev/null 2>&1 || true
+
+    mkdir -p /etc/sysctl.d >/dev/null 2>&1 || true
+    cat > "$bbr_conf" 2>/dev/null << 'EOF' || true
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+    # 同步清理 /etc/sysctl.conf 中的冲突项并追加
+    if [ -f /etc/sysctl.conf ]; then
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf 2>/dev/null || true
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf 2>/dev/null || true
+    fi
+
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    sysctl -p "$bbr_conf" >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
+
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [ "$current_cc" = "bbr" ]; then
+        green "BBR 加速通道已成功开启！(当前队列: $(Check_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null); echo "${current_cc}+${Check_qdisc:-fq}"))"
+    else
+        yellow "提示: 当前虚拟化容器内核不支持直接挂载 BBR (当前为: ${current_cc:-默认})，已自动跳过且不影响节点运行。"
+    fi
+}
+
+disable_bbr() {
+    yellow "正在关闭 BBR 加速通道并恢复默认拥塞控制..."
+    rm -f "$bbr_conf" >/dev/null 2>&1 || true
+    if [ -f /etc/sysctl.conf ]; then
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+    fi
+
+    # 恢复默认 cubic 与队列算法
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    sysctl -p >/dev/null 2>&1 || true
+
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    green "BBR 加速已关闭！(当前拥塞控制已恢复为: ${purple}${current_cc:-cubic}${re})"
+}
+
+manage_bbr_menu() {
+    clear; echo ""
+    green "=== BBR 加速通道管理 ==="
+    echo -e "\n当前 BBR 状态: $(check_bbr_status)\n"
+    green "1. 开启 BBR 加速 (bbr + fq)"
+    skyblue "----------------------------------------"
+    red   "2. 关闭 BBR 加速 (恢复默认 cubic)"
+    skyblue "----------------------------------------"
+    purple "0. 返回主菜单"
+    skyblue "----------------------------------------"
+    reading "请输入选择: " bbr_choice
+    echo ""
+    case "$bbr_choice" in
+        1) enable_bbr ;;
+        2) disable_bbr ;;
+        0) return ;;
+        *) red "无效的选项！" ;;
+    esac
+}
 
 # =========================
 # 64M 内存防崩溃与内核网络优化
@@ -912,6 +997,9 @@ install_singbox() {
     clear
     purple "=== 开始配置并安装 sing-box (64M轻量稳定版) ==="
 
+    # 搭建节点时自动开启 BBR 加速
+    enable_bbr
+
     configure_inbound_stack_and_ip
 
     SELECTED_PROTOS=""
@@ -1179,7 +1267,7 @@ get_info() {
     fi
     rebuild_urls
     clear
-    green "sing-box 安装并启动成功！(后续随时输入 sb 即可打开管理菜单)"
+    green "sing-box 安装并启动成功！(BBR加速状态: $(check_bbr_status) | 快捷键: sb)"
     check_nodes
 }
 
@@ -1208,6 +1296,7 @@ perform_full_uninstall() {
     pkill -9 -f "${work_dir}/argo" >/dev/null 2>&1 || true
 
     clean_firewall_rules
+    disable_bbr >/dev/null 2>&1 || true
 
     if [ -f "${work_dir}/hosts.bak" ]; then
         cp -f "${work_dir}/hosts.bak" /etc/hosts >/dev/null 2>&1 || true
@@ -1222,7 +1311,7 @@ perform_full_uninstall() {
     rm -rf "${work_dir}" >/dev/null 2>&1 || true
     rm -f /usr/bin/sb /usr/local/bin/sb /bin/sb >/dev/null 2>&1 || true
 
-    green "\nsing-box、Argo、防火墙规则及 sb 快捷指令已彻底卸载，系统已恢复初始状态！\n"
+    green "\nsing-box、Argo、BBR配置、防火墙规则及 sb 快捷指令已彻底卸载，系统已恢复初始状态！\n"
 }
 
 uninstall_singbox() {
@@ -1615,13 +1704,14 @@ EOF
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
+    bbr_status=$(check_bbr_status 2>/dev/null)
 
     clear; echo ""
     purple "=== sing-box 64M极简管理面板 (快捷键: sb) ==="
     echo ""
-    purple "sing-box 状态: ${singbox_status}   |   Argo 状态: ${argo_status}"
+    purple "sing-box: ${singbox_status}  |  Argo: ${argo_status}  |  BBR: ${bbr_status}"
     echo "=========================================================="
-    green "1. 安装 / 重装 sing-box (指定协议 + 指定端口 + 设v4/v6/双栈)"
+    green "1. 安装 / 重装 sing-box (自动开BBR + 指定协议/端口 + 设v4/v6/双栈)"
     red   "2. 彻底卸载 sing-box 并恢复初始状态"
     echo "=========================================================="
     green "3. 查看节点 Base64 编码"
@@ -1632,6 +1722,7 @@ menu() {
     green "7. sing-box 服务管理"
     green "8. Argo 隧道管理"
     green "9. WARP 分流管理"
+    green "10. BBR 加速管理 (开启 / 关闭 BBR 加速通道)"
     echo "=========================================================="
     red   "0. 退出脚本"
     echo "=========================================================="
@@ -1654,20 +1745,30 @@ case "$1" in
         check_nodes
         exit 0
         ;;
+    -bon | --bbr-on)
+        enable_bbr
+        exit 0
+        ;;
+    -boff | --bbr-off | -d | --disable-bbr)
+        disable_bbr
+        exit 0
+        ;;
     -h | --help)
         echo ""
         green "快捷键用法: sb [参数]"
-        green "  sb          打开交互式管理菜单"
-        green "  sb -c       直接输出节点 Base64 编码"
-        green "  sb -r       刷新 Argo 临时域名并输出 Base64"
-        green "  sb -u       直接彻底卸载并恢复初始状态"
+        green "  sb                 打开交互式管理菜单"
+        green "  sb -c              直接输出节点 Base64 编码"
+        green "  sb -boff           直接关闭 BBR 加速通道 (或 sb --bbr-off)"
+        green "  sb -bon            直接开启 BBR 加速通道 (或 sb --bbr-on)"
+        green "  sb -r              刷新 Argo 临时域名并输出 Base64"
+        green "  sb -u              直接彻底卸载并恢复初始状态"
         echo ""
         exit 0
         ;;
-    *)
+    "")
         while true; do
             menu
-            reading "请输入选择 (0-9): " choice
+            reading "请输入选择 (0-10): " choice
             echo ""
             need_pause=true
             case "${choice}" in
@@ -1703,11 +1804,16 @@ case "$1" in
                 7)  manage_singbox;          need_pause=true ;;
                 8)  manage_argo;             need_pause=true ;;
                 9)  warp_manage;             need_pause=true ;;
+                10) manage_bbr_menu;         need_pause=true ;;
                 0)  exit 0 ;;
-                *)  red "无效的选项，请输入 0-9"; need_pause=true ;;
+                *)  red "无效的选项，请输入 0-10"; need_pause=true ;;
             esac
             [ "$need_pause" = true ] && read -n 1 -s -r -p $'\033[1;91m按任意键返回主菜单...\033[0m'
         done
+        ;;
+    *)
+        red "未知参数: $1 (输入 sb -h 查看可用参数)"
+        exit 1
         ;;
 esac
 ===SB_MAIN_SCRIPT_EOF===
@@ -1718,7 +1824,7 @@ esac
     ln -sf /etc/sing-box/sb.sh /bin/sb 2>/dev/null || true
 fi
 
-# 针对 Alpine 系统自动检查并安装 bash 解释器，防止 -sh: sb: not found
+# 针对 Alpine 系统自动检查并安装 bash 解释器
 if ! command -v bash >/dev/null 2>&1; then
     echo "正在为 Alpine 安装 bash 运行环境..."
     if command -v apk >/dev/null 2>&1; then
@@ -1730,5 +1836,4 @@ if ! command -v bash >/dev/null 2>&1; then
     fi
 fi
 
-# 绑定终端输入流并启动管理面板
 exec bash /etc/sing-box/sb.sh "$@" < /dev/tty
