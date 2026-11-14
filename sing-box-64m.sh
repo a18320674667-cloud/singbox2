@@ -1,4 +1,14 @@
-#!/bin/bash
+#!/bin/sh
+
+# ==========================================================
+# 自释放与 sb 快捷键强制绑定层 (兼容 Alpine / Debian 及任意运行方式)
+# ==========================================================
+mkdir -p /etc/sing-box
+
+# 若当前不是从 /etc/sing-box/sb.sh 启动，则自动将完整脚本写入磁盘并绑定 sb
+if [ "$0" != "/etc/sing-box/sb.sh" ] && [ "$0" != "/usr/bin/sb" ] && [ "$0" != "/bin/sb" ]; then
+    cat > /etc/sing-box/sb.sh << '===SB_MAIN_SCRIPT_EOF==='
+#!/usr/bin/env bash
 
 # =========================
 # sing-box 64M极简低内存多协议脚本 (纯Base64输出版)
@@ -34,44 +44,30 @@ swap_file="/swapfile_sb"
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
 
-# 检查 root 权限
 [[ $EUID -ne 0 ]] && red "请在 root 用户下运行脚本 (输入 sudo -i 切换)" && exit 1
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 兼容 Alpine(BusyBox) 与 Debian 的 Base64 不换行编码函数
+# 兼容 Alpine(BusyBox) 与 Debian 的 Base64 不换行编码
 b64_encode() {
     base64 -w0 2>/dev/null || base64 | tr -d '\n\r'
 }
 
-# 兼容随机端口生成
+# 随机端口生成
 rand_port() {
     shuf -i 10000-60000 -n 1 2>/dev/null || echo $(( (RANDOM % 50000) + 10000 ))
 }
 
-# =========================
-# 自动绑定 sb 快捷键 (脚本启动即生效)
-# =========================
-bind_sb_shortcut() {
-    mkdir -p "$work_dir"
-    local script_path=""
-    if [ -f "$0" ]; then
-        script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    fi
-    if [ -n "$script_path" ] && [ -f "$script_path" ] && [[ "$script_path" != *"/dev/fd/"* ]]; then
-        if [ "$script_path" != "${work_dir}/sb.sh" ]; then
-            cp -f "$script_path" "${work_dir}/sb.sh" 2>/dev/null || true
-        fi
-        chmod +x "${work_dir}/sb.sh" 2>/dev/null || true
-        ln -sf "${work_dir}/sb.sh" /usr/bin/sb 2>/dev/null || true
-        ln -sf "${work_dir}/sb.sh" /usr/local/bin/sb 2>/dev/null || true
-    fi
+# 确保 sb 软链接始终存在
+ensure_sb_links() {
+    chmod +x "${work_dir}/sb.sh" 2>/dev/null || true
+    ln -sf "${work_dir}/sb.sh" /usr/bin/sb 2>/dev/null || true
+    ln -sf "${work_dir}/sb.sh" /usr/local/bin/sb 2>/dev/null || true
+    ln -sf "${work_dir}/sb.sh" /bin/sb 2>/dev/null || true
 }
-
-# 启动时立即绑定 sb 快捷键
-bind_sb_shortcut
+ensure_sb_links
 
 # =========================
 # 64M 内存防崩溃与内核网络优化
@@ -82,7 +78,6 @@ optimize_low_memory() {
     local swap_total
     swap_total=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
 
-    # 开启双栈兼容与内存超分配许可
     sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
     sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
     sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
@@ -99,7 +94,7 @@ optimize_low_memory() {
                 green "128MB Swap 启用成功！"
             else
                 rm -f "$swap_file" >/dev/null 2>&1 || true
-                yellow "当前容器不支持挂载 Swap，将通过 GOMEMLIMIT 内存硬限制保障稳定运行。"
+                yellow "当前容器不支持挂载 Swap，已通过 GOMEMLIMIT 内存硬限制保障稳定运行。"
             fi
         fi
     fi
@@ -208,7 +203,7 @@ stop_argo()       { manage_service "argo" "stop"; }
 restart_argo()    { manage_service "argo" "restart"; }
 
 # =========================
-# 极简依赖安装 (去除 Nginx，绝不执行全量 upgrade)
+# 极简依赖安装 (绝不执行全量 upgrade)
 # =========================
 manage_packages() {
     local action=$1
@@ -326,7 +321,6 @@ configure_inbound_stack_and_ip() {
             save_meta "CUSTOM_NODE_IP" "$input_custom"
             ;;
         *)
-            # 默认双栈
             save_meta "LISTEN_IP" "::"
             if [ -n "$auto_v4" ] && [ -n "$auto_v6" ]; then
                 save_meta "STACK_MODE" "dual"
@@ -355,7 +349,6 @@ configure_inbound_stack_and_ip() {
             ;;
     esac
 
-    # 如果 inbounds.json 已存在，同步更新其中的 listen 字段
     if [ -f "${conf_dir}/inbounds.json" ]; then
         load_meta
         jq --arg lip "${LISTEN_IP:-::}" '(.inbounds[].listen) = $lip' \
@@ -430,10 +423,9 @@ prompt_custom_port() {
             continue
         fi
 
-        # 检查是否与当前 inbounds.json 中已分配的其他协议端口冲突
         if [ -f "${conf_dir}/inbounds.json" ]; then
             if jq -e --argjson p "$chosen_p" '.inbounds[] | select(.listen_port == $p)' "${conf_dir}/inbounds.json" >/dev/null 2>&1; then
-                yellow "端口 ${chosen_p} 已被其他入站协议占用，请换一个端口！"
+                yellow "端口 ${chosen_p} 已被其他入站协议占用，请重新指定！"
                 default_p=$(rand_port)
                 continue
             fi
@@ -444,9 +436,6 @@ prompt_custom_port() {
     green " -> [${proto_title}] 端口已设为: ${purple}${Selected_Port}${re}"
 }
 
-# =========================
-# 按需下载二进制文件
-# =========================
 get_arch() {
     case "$(uname -m)" in
         'x86_64' | 'amd64')  echo 'amd64' ;;
@@ -763,7 +752,6 @@ rebuild_urls() {
     local cfip="${CFIP_SAVED:-${CFIP}}"
     local cfport="${CFPORT_SAVED:-${CFPORT}}"
 
-    # 根据 STACK_MODE 构建要生成节点的入站地址数组与后缀
     local addr_list=()
     local suffix_list=()
     case "${STACK_MODE}" in
@@ -797,7 +785,6 @@ rebuild_urls() {
 
     > "$client_dir"
 
-    # 1. vless-reality
     if proto_exists "vless-reality"; then
         local v_port v_uuid v_sni
         v_port=$(jq -r '.inbounds[] | select(.tag == "vless-reality") | .listen_port' "$inbounds_file")
@@ -808,7 +795,6 @@ rebuild_urls() {
         done
     fi
 
-    # 2. vmess-ws (Argo)
     if proto_exists "vmess-ws"; then
         local m_uuid argodomain
         m_uuid=$(jq -r '.inbounds[] | select(.tag == "vmess-ws") | .users[0].uuid' "$inbounds_file")
@@ -824,7 +810,6 @@ rebuild_urls() {
         echo "vmess://$(printf '%s' "$vmess_json" | b64_encode)" >> "$client_dir"
     fi
 
-    # 3. hysteria2
     if proto_exists "hysteria2"; then
         local h_port h_pass mport_str=""
         h_port=$(jq -r '.inbounds[] | select(.tag == "hysteria2") | .listen_port' "$inbounds_file")
@@ -837,7 +822,6 @@ rebuild_urls() {
         done
     fi
 
-    # 4. tuic
     if proto_exists "tuic"; then
         local t_port t_uuid t_pass
         t_port=$(jq -r '.inbounds[] | select(.tag == "tuic") | .listen_port' "$inbounds_file")
@@ -848,7 +832,6 @@ rebuild_urls() {
         done
     fi
 
-    # 5. anytls
     if proto_exists "anytls"; then
         local a_port a_pass
         a_port=$(jq -r '.inbounds[] | select(.tag == "anytls") | .listen_port' "$inbounds_file")
@@ -858,7 +841,6 @@ rebuild_urls() {
         done
     fi
 
-    # 6. socks5-in
     if proto_exists "socks5-in"; then
         local s_port s_user s_pass s_auth
         s_port=$(jq -r '.inbounds[] | select(.tag == "socks5-in") | .listen_port' "$inbounds_file")
@@ -870,7 +852,6 @@ rebuild_urls() {
         done
     fi
 
-    # 7. shadowsocks-2022
     if proto_exists "shadowsocks-2022"; then
         local ss_port ss_method ss_key ss_auth
         ss_port=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .listen_port' "$inbounds_file")
@@ -882,7 +863,6 @@ rebuild_urls() {
         done
     fi
 
-    # 编码为纯 Base64 字符串写入 sub.txt
     if [ -s "$client_dir" ]; then
         b64_encode < "$client_dir" > "$sub_file"
     else
@@ -905,9 +885,6 @@ check_nodes() {
     echo ""
 }
 
-# =========================
-# 交互式选择要生成的协议
-# =========================
 select_install_protocols() {
     echo ""
     purple "=== 选择要生成的协议节点 (支持多选) ==="
@@ -930,18 +907,13 @@ select_install_protocols() {
     fi
 }
 
-# =========================
-# 安装主流程
-# =========================
 install_singbox() {
     optimize_low_memory
     clear
     purple "=== 开始配置并安装 sing-box (64M轻量稳定版) ==="
 
-    # 第一步：设置入站模式 (IPv4 / IPv6 / 双栈) 与入站地址
     configure_inbound_stack_and_ip
 
-    # 第二步：选择要生成的协议
     SELECTED_PROTOS=""
     select_install_protocols
 
@@ -1014,7 +986,6 @@ EOF
 }
 EOF
 
-    # 第三步：逐个协议提示用户指定端口并写入 inbounds.json
     echo '{"inbounds": []}' > "${conf_dir}/inbounds.json"
     echo ""
     purple "=== 请为所选协议设置监听端口 ==="
@@ -1078,9 +1049,6 @@ EOF
 EOF
 }
 
-# =========================
-# 守护进程配置 (带 GOMEMLIMIT 内存硬限制)
-# =========================
 main_systemd_services() {
     load_meta
     local argo_p="${VMESS_PORT:-8001}"
@@ -1252,9 +1220,9 @@ perform_full_uninstall() {
     fi
 
     rm -rf "${work_dir}" >/dev/null 2>&1 || true
-    rm -f /usr/bin/sb /usr/local/bin/sb >/dev/null 2>&1 || true
+    rm -f /usr/bin/sb /usr/local/bin/sb /bin/sb >/dev/null 2>&1 || true
 
-    green "\nsing-box、Argo、防火墙规则及快捷指令已彻底卸载，系统已恢复初始状态！\n"
+    green "\nsing-box、Argo、防火墙规则及 sb 快捷指令已彻底卸载，系统已恢复初始状态！\n"
 }
 
 uninstall_singbox() {
@@ -1268,7 +1236,7 @@ uninstall_singbox() {
 }
 
 # =========================
-# 协议节点管理中心 (删除/恢复/添加指定协议)
+# 协议节点管理中心
 # =========================
 show_all_proto_status() {
     local inbounds_file="${conf_dir}/inbounds.json"
@@ -1540,9 +1508,6 @@ change_config() {
     esac
 }
 
-# =========================
-# 服务管理、Argo管理、WARP分流
-# =========================
 manage_singbox() {
     clear; echo ""
     green "=== sing-box 服务管理 (状态: $(check_singbox)) ===\n"
@@ -1647,9 +1612,6 @@ EOF
     esac
 }
 
-# =========================
-# 主菜单
-# =========================
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
@@ -1723,7 +1685,7 @@ case "$1" in
                     else
                         red "不支持的 init 系统"; exit 1
                     fi
-                    bind_sb_shortcut
+                    ensure_sb_links
                     sleep 2
                     get_info
                     ;;
@@ -1748,3 +1710,25 @@ case "$1" in
         done
         ;;
 esac
+===SB_MAIN_SCRIPT_EOF===
+
+    chmod +x /etc/sing-box/sb.sh
+    ln -sf /etc/sing-box/sb.sh /usr/bin/sb 2>/dev/null || true
+    ln -sf /etc/sing-box/sb.sh /usr/local/bin/sb 2>/dev/null || true
+    ln -sf /etc/sing-box/sb.sh /bin/sb 2>/dev/null || true
+fi
+
+# 针对 Alpine 系统自动检查并安装 bash 解释器，防止 -sh: sb: not found
+if ! command -v bash >/dev/null 2>&1; then
+    echo "正在为 Alpine 安装 bash 运行环境..."
+    if command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1
+        apk add --no-cache bash >/dev/null 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y bash >/dev/null 2>&1
+    fi
+fi
+
+# 绑定终端输入流并启动管理面板
+exec bash /etc/sing-box/sb.sh "$@" < /dev/tty
